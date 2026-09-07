@@ -1,0 +1,12 @@
+*.log
+*~
+.DS_Store
+/tmp-*/
+
+# Dart build outputs (pubspec.lock IS tracked: reproducible app builds)
+.dart_tool/
+build/
+.idea/
+.vscode/
+*.dart.js
+*.dart.js.*

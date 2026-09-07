@@ -1,0 +1,31 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash syntax
+        run: bash -n bin/* install.sh tool/*.sh
+      - name: version consistency (VERSION file vs pubspec literal)
+        run: |
+          test "$(cat VERSION)" = "$(sed -n 's/^version: //p' tui/pubspec.yaml)"
+
+  dart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+      - name: dependencies
+        working-directory: tui
+        run: dart pub get
+      - name: analyze
+        working-directory: tui
+        run: dart analyze
+      - name: tests
+        working-directory: tui
+        run: dart test

@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# webapp-help — overview of the webapp-* toolkit (Omarchy-style webapps for Void/KDE).
+# Usage: webapp-help
+set -euo pipefail
+
+# Never inherit a hostile field separator/glob config.
+unset IFS GLOBIGNORE
+
+# --version source of truth: $PREFIX/VERSION shipped by install.sh.
+cmd_version() {
+  local d
+  d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [[ -f "$d/../VERSION" ]]; then
+    cat "$d/../VERSION"
+  else
+    printf 'dev'
+  fi
+}
+
+cat <<'EOF'
+webapp-* — isolated webapps for any distro/desktop (chrome --app / firefox profiles)
+
+COMMANDS
+  webapp-create                 Create a webapp (interactive if args missing).
+                                webapp-create
+                                webapp-create "ChatGPT" https://chatgpt.com chrome
+                                webapp-create --name "X" --url https://x.com --engine firefox
+  webapp-launch-chrome          Run a URL as an isolated Chrome SSB window.
+                                (Invoked by .desktop files; rarely by hand.)
+  webapp-launch-firefox         Run a URL in a self-contained Firefox profile
+                                with tab strip removed (min/max/close kept).
+                                (Invoked by .desktop files; rarely by hand.)
+  webapp-remove [--purge] [...] Delete .desktop + icon + KWin rule; --purge
+                                also wipes isolated browser data. No args =
+                                interactive multi-select.
+  webapp-list                   Table of installed webapps (name, engine, URL).
+  webapp-update [--ref X]       Upgrade toolkit in place (data untouched).
+                                webapp-update --check for a dry run.
+  webapp-uninstall [--purge]    Remove the TOOLKIT (not a webapp — that's
+                                webapp-remove). --purge wipes every webapp
+                                too. Confirms before deleting.
+  webapp-doctor [name...]       Health check: launcher, icon, StartupWMClass,
+                                desktop validation, profile, CSS version,
+                                KWin rule, live process, orphans.
+  webapp-doctor --probe [name]  Live window identity via KWin (focus the app
+                                window first): prints Wayland app_id + matched
+                                .desktop file. The icon debugger of last resort.
+
+WORKFLOWS
+  New app:      webapp-create "Strafe" https://strafe.com firefox
+  Verify:       webapp-doctor Strafe
+  Remove:       webapp-remove --purge Strafe
+  Icon wrong:   launch from Kickoff, focus window, webapp-doctor --probe Strafe
+
+WHERE THINGS LIVE
+  Launchers ................. ~/.local/share/webapps/bin/webapp-*
+  Desktop files ............. ~/.local/share/applications/<Name>.desktop
+  Icons (hicolor theme) ..... ~/.local/share/icons/hicolor/128x128/apps/<slug>.png
+  Browser data + run logs .. ~/.local/share/webapps/ (chrome-<slug>/, firefox-<slug>/, <slug>.log)
+  Window rules .............. ~/.config/kwinrulesrc ("webapp: <Name>")
+
+NOTES
+  - Each webapp is isolated: own Chrome data dir or Firefox profile (log in once).
+  - Firefox apps use native Wayland, dedicated app_id, and (on Plasma) a KWin
+    rule so the taskbar shows the site icon, not the browser logo.
+
+PORTABILITY (distro- and DE-agnostic by design)
+  Hard requirements: bash, curl, setsid + one browser (firefox or a
+  Chromium-family build for the chrome engine). Run webapp-doctor --deps
+  for a full check with install commands for your distro.
+  - Any distro: no package-manager calls in the code; only the install
+    tips adapt (xbps/pacman/dnf/apt/zypper).
+  - Any Wayland/X11 desktop: .desktop files use absolute Exec paths, so
+    they work regardless of session PATH. Icon matching uses app_id +
+    StartupWMClass everywhere, plus a KWin rule automatically on Plasma.
+  - Probing window identity: webapp-doctor --probe auto-detects KWin,
+    niri, Hyprland, Sway (GNOME: prints Looking Glass steps).
+EOF
+
+printf '\nwebapp-kit %s\n' "$(cmd_version)"
+
+if ! command -v gum >/dev/null 2>&1; then
+  echo ""
+  HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/webapp-env.sh"
+  if [[ -f "$HELPER" ]]; then
+    # shellcheck disable=SC1090
+    source "$HELPER" 2>/dev/null || true
+  fi
+  if declare -F webapp_install_cmd >/dev/null 2>&1; then
+    GUM_TIP="$(webapp_install_cmd gum)"
+    if [[ -n "$GUM_TIP" ]]; then
+      echo "Tip: $GUM_TIP  (for the Omarchy-style interactive prompts)"
+    fi
+  else
+    echo "Tip: sudo xbps-install -S gum  (for the Omarchy-style interactive prompts)"
+  fi
+fi

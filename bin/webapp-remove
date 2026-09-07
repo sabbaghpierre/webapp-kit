@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# webapp-remove — remove isolated webapp launchers (Omarchy-style).
+#
+# Deletes the .desktop file + downloaded icon, and optionally the isolated
+# browser data (Chrome --user-data-dir / Firefox per-app profile).
+#
+# Usage:
+#   webapp-remove                  # interactive multi-select (gum or numbered list)
+#   webapp-remove "My App" ...     # remove by name (keeps isolated data)
+#   webapp-remove --purge "My App" # also delete isolated browser data
+set -euo pipefail
+
+# Never inherit a hostile field separator/glob config.
+unset IFS GLOBIGNORE
+
+# --version source of truth: $PREFIX/VERSION shipped by install.sh.
+cmd_version() {
+  local d
+  d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [[ -f "$d/../VERSION" ]]; then
+    cat "$d/../VERSION"
+  else
+    printf 'dev'
+  fi
+}
+
+ICON_DIR="$HOME/.local/share/applications/icons"
+DESKTOP_DIR="$HOME/.local/share/applications"
+DATA_ROOT="$HOME/.local/share/webapps"
+
+# KWin helpers (rule cleanup); optional.
+KWIN_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/webapp-kwin.sh"
+[[ -f "$KWIN_HELPER" ]] || KWIN_HELPER="$HOME/.local/share/webapps/bin/webapp-kwin.sh"
+if [[ -f "$KWIN_HELPER" ]]; then
+  # shellcheck disable=SC1090
+  source "$KWIN_HELPER"
+fi
+
+PURGE=false
+NAMES=()
+while (($# > 0)); do
+  case "$1" in
+    --purge | --purge-data) PURGE=true; shift ;;
+    --version) printf '%s %s\n' "$(basename "$0")" "$(cmd_version)"; exit 0 ;;
+    -h | --help)
+      echo 'Usage: webapp-remove [--purge] [name...]'
+      exit 0
+      ;;
+    --) shift; while (($# > 0)); do NAMES+=("$1"); shift; done; break ;;
+    -*) echo "webapp-remove: unknown flag: $1" >&2; exit 1 ;;
+    *) NAMES+=("$1"); shift ;;
+  esac
+done
+
+has_gum() { command -v gum >/dev/null 2>&1; }
+
+slugify() {
+  local s="$1"
+  s="${s// /-}"
+  s="$(printf '%s' "$s" | tr -c '[:alnum:]-_.' '-')"
+  s="$(printf '%s' "$s" | sed -e 's/-\{2,\}/-/g' -e 's/^[-.]//' -e 's/[-.]$//')"
+  [[ -z "$s" ]] && s="webapp"
+  printf '%s' "$s"
+}
+
+list_webapps() {
+  local file
+  while IFS= read -r -d '' file; do
+    if grep -q '^Exec=.*webapp-launch-' "$file"; then
+      basename "${file%.desktop}"
+    fi
+  done < <(find "$DESKTOP_DIR" -maxdepth 1 -name '*.desktop' -print0 2>/dev/null)
+}
+
+purge_isolated_data() { # $1=app name
+  local name="$1" slug="$2"
+  local removed=0
+  if [[ -d "$DATA_ROOT/chrome-${slug}" ]]; then
+    rm -rf "$DATA_ROOT/chrome-${slug}"
+    echo "  purged Chrome data: $DATA_ROOT/chrome-${slug}"
+    removed=1
+  fi
+  # Firefox self-contained profile (ice-ssb style): plain rm -rf, no registry.
+  if [[ -d "$DATA_ROOT/firefox-${slug}" ]]; then
+    rm -rf "$DATA_ROOT/firefox-${slug}"
+    echo "  purged Firefox data: $DATA_ROOT/firefox-${slug}"
+    removed=1
+  fi
+  # Per-app run log.
+  rm -f "$DATA_ROOT/${slug}.log"
+  if [[ "$removed" == "0" ]]; then
+    echo "  (no isolated data found)"
+  fi
+}
+
+if ((${#NAMES[@]} == 0)); then
+  mapfile -t ALL < <(list_webapps | sort)
+  if ((${#ALL[@]} == 0)); then
+    echo "No web apps to remove."
+    exit 1
+  fi
+  if has_gum; then
+    mapfile -t NAMES < <(gum choose --no-limit --header "Select web app(s) to remove (SPACE to toggle, ENTER to confirm)..." "${ALL[@]}")
+  else
+    echo "Select web app(s) to remove (space-separated numbers, ENTER for all listed):" >&2
+    i=1
+    for a in "${ALL[@]}"; do echo "  $i) $a" >&2; i=$((i + 1)); done
+    printf 'Choice> ' >&2
+    IFS= read -r choice || choice=""
+    if [[ -z "$choice" ]]; then
+      NAMES=("${ALL[@]}")
+    else
+      for n in $choice; do
+        if [[ "$n" =~ ^[0-9]+$ ]] && ((n >= 1 && n <= ${#ALL[@]})); then
+          NAMES+=("${ALL[$((n - 1))]}")
+        fi
+      done
+    fi
+  fi
+fi
+
+if ((${#NAMES[@]} == 0)); then
+  echo "You must select at least one web app to remove." >&2
+  exit 1
+fi
+
+for APP_NAME in "${NAMES[@]}"; do
+  SLUG="$(slugify "$APP_NAME")"
+  rm -f "$DESKTOP_DIR/$APP_NAME.desktop"
+  # Icons we manage: hicolor theme file (current) + legacy per-app file.
+  rm -f "$HOME/.local/share/icons/hicolor/128x128/apps/$SLUG.png"
+  rm -f "$ICON_DIR/$APP_NAME.png"
+  echo "Removed $APP_NAME"
+  # Drop our KWin icon-matching rule on every removal (it points at a
+  # deleted .desktop file); reconfigure once at the end.
+  if declare -F kwin_rule_remove >/dev/null 2>&1; then
+    kwin_rule_remove "$APP_NAME"
+    KWIN_TOUCHED=true
+  fi
+  if [[ "$PURGE" == "true" ]]; then
+    purge_isolated_data "$APP_NAME" "$SLUG"
+  elif [[ -t 0 ]] && { [[ -d "$DATA_ROOT/chrome-${SLUG}" ]] || [[ -d "$DATA_ROOT/firefox-${SLUG}" ]]; }; then
+    # Interactive runs ask; non-interactive keeps data (use --purge to force).
+    answer=""
+    if has_gum; then
+      if gum confirm "Also delete isolated browser data for '$APP_NAME'?"; then answer="y"; fi
+    else
+      printf "Also delete isolated browser data for '%s'? [y/N]> " "$APP_NAME" >&2
+      IFS= read -r answer || answer=""
+    fi
+    case "$answer" in
+      y | Y | yes | YES) purge_isolated_data "$APP_NAME" "$SLUG" ;;
+      *) echo "  (kept isolated data)" ;;
+    esac
+  fi
+done
+
+if command -v kbuildsycoca6 >/dev/null 2>&1; then
+  kbuildsycoca6 >/dev/null 2>&1 || true
+fi
+
+if [[ "${KWIN_TOUCHED:-false}" == "true" ]] && declare -F kwin_reconfigure >/dev/null 2>&1; then
+  kwin_reconfigure || true
+fi

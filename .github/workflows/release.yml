@@ -1,0 +1,50 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: version consistency (VERSION file vs pubspec literal)
+        run: |
+          test "$(cat VERSION)" = "$(sed -n 's/^version: //p' tui/pubspec.yaml)"
+
+      - uses: dart-lang/setup-dart@v1
+
+      - name: dependencies
+        working-directory: tui
+        run: dart pub get
+
+      - name: analyze
+        working-directory: tui
+        run: dart analyze
+
+      - name: tests
+        working-directory: tui
+        run: dart test
+
+      - name: bash syntax
+        run: bash -n bin/* install.sh tool/*.sh
+
+      - name: compile TUI (linux-x64, version baked in)
+        working-directory: tui
+        run: dart compile exe -DAPP_VERSION="${GITHUB_REF_NAME#v}" bin/webapp_tui.dart -o webapp-tui
+
+      - name: "publish release (retag-safe: refresh asset if release exists)"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload --clobber "${GITHUB_REF_NAME}" tui/webapp-tui
+          else
+            gh release create "${GITHUB_REF_NAME}" --generate-notes tui/webapp-tui
+          fi

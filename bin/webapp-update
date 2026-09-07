@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# webapp-update — upgrade the webapp-kit toolkit in place.
+#
+# Resolves its install prefix from its own location, then re-runs the
+# installer at that prefix (idempotent by design: code refreshed, your
+# apps/profiles/logins untouched).
+#
+# Usage:
+#   webapp-update                # upgrade to latest main
+#   webapp-update --ref v1.0.0   # upgrade/downgrade to a branch or tag
+#   webapp-update --check        # dry run: compare local vs remote version
+#
+# Env: WEBAPP_REPO=owner/repo (default sabbaghpierre/webapp-kit).
+# Exit codes: 0 = done / already current, 1 = error, 2 = update available (--check).
+set -euo pipefail
+
+# Never inherit a hostile field separator/glob config.
+unset IFS GLOBIGNORE
+
+REPO="${WEBAPP_REPO:-sabbaghpierre/webapp-kit}"
+REF="main"
+CHECK=false
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ "$SELF_DIR" == */bin ]]; then
+  PREFIX="$(dirname "$SELF_DIR")"
+else
+  PREFIX="$HOME/.local/share/webapps"
+fi
+
+cmd_version() {
+  if [[ -f "$PREFIX/VERSION" ]]; then
+    cat "$PREFIX/VERSION"
+  else
+    printf 'dev'
+  fi
+}
+
+usage() {
+  echo "Usage: webapp-update [--ref branch-or-tag] [--check]"
+}
+
+while (($# > 0)); do
+  case "$1" in
+    --ref) REF="${2:?--ref needs a value}"; shift 2 ;;
+    --ref=*) REF="${1#--ref=}"; shift ;;
+    --check) CHECK=true; shift ;;
+    -h | --help) usage; exit 0 ;;
+    --version) printf '%s %s\n' "$(basename "$0")" "$(cmd_version)"; exit 0 ;;
+    *) echo "webapp-update: unknown flag: $1" >&2; usage >&2; exit 1 ;;
+  esac
+done
+
+if [[ "$CHECK" == "true" ]]; then
+  command -v curl >/dev/null 2>&1 || {
+    echo "webapp-update: curl is required to check for updates." >&2
+    exit 1
+  }
+  LOCAL_VER="$(cmd_version)"
+  REMOTE_VER="$(curl -fsSL "https://raw.githubusercontent.com/$REPO/$REF/VERSION" 2>/dev/null || true)"
+  if [[ -z "$REMOTE_VER" ]]; then
+    echo "webapp-update: could not fetch remote version ($REPO@$REF)." >&2
+    exit 1
+  fi
+  echo "local:  $LOCAL_VER"
+  echo "remote: $REMOTE_VER ($REF)"
+  if [[ "$LOCAL_VER" == "$REMOTE_VER" ]]; then
+    echo "already current."
+    exit 0
+  else
+    echo "update available: run webapp-update [--ref $REF]."
+    exit 2
+  fi
+fi
+
+if [[ "$REF" != "main" ]]; then export WEBAPP_REF="$REF"; fi
+curl -fsSL "https://raw.githubusercontent.com/$REPO/main/install.sh" |
+  bash -s -- --prefix "$PREFIX"

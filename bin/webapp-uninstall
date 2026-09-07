@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# webapp-uninstall — remove the webapp-kit TOOLKIT (not a single webapp).
+#
+# To delete ONE webapp, use: webapp-remove [name] (NOT this command).
+#
+#   webapp-uninstall            remove toolkit code, KEEP all app data
+#   webapp-uninstall --purge    remove toolkit code AND every webapp
+#                               (desktop, icon, KWin rule, isolated data)
+#   webapp-uninstall [--purge] --yes   skip confirmation (for scripts)
+#
+# Never touched: your main browser profiles, system packages, repo clones.
+set -euo pipefail
+
+# Never inherit a hostile field separator/glob config.
+unset IFS GLOBIGNORE
+
+PURGE=false
+YES=false
+
+usage() {
+  echo "Usage: webapp-uninstall [--purge] [--yes]"
+  echo ""
+  echo "Removes the webapp-kit toolkit itself."
+  echo "To delete a single webapp instead: webapp-remove [name]"
+}
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ "$SELF_DIR" == */bin ]]; then
+  PREFIX="$(dirname "$SELF_DIR")"
+else
+  PREFIX="$HOME/.local/share/webapps"
+fi
+BIN_DST="$PREFIX/bin"
+
+cmd_version() {
+  if [[ -f "$PREFIX/VERSION" ]]; then
+    cat "$PREFIX/VERSION"
+  else
+    printf 'dev'
+  fi
+}
+
+while (($# > 0)); do
+  case "$1" in
+    --purge) PURGE=true; shift ;;
+    --yes | -y) YES=true; shift ;;
+    -h | --help) usage; exit 0 ;;
+    --version) printf '%s %s\n' "$(basename "$0")" "$(cmd_version)"; exit 0 ;;
+    -*)
+      echo "webapp-uninstall: unknown flag: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+    *)
+      # Guardrail: a bare name almost certainly means "delete this webapp".
+      if [[ -x "$BIN_DST/webapp-list" ]] &&
+        "$BIN_DST/webapp-list" 2>/dev/null | grep -q -E "^$1([[:space:]]|$)"; then
+        echo "webapp-uninstall removes the webapp-kit toolkit itself —" >&2
+        echo "did you mean: webapp-remove \"$1\" ?" >&2
+        exit 1
+      fi
+      echo "webapp-uninstall takes no app names (did you mean webapp-remove?)." >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+# Collect purge targets BEFORE deleting anything (helpers live in bin/).
+PURGE_APPS=()
+if [[ "$PURGE" == "true" && -x "$BIN_DST/webapp-list" ]]; then
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && PURGE_APPS+=("$line")
+  done < <("$BIN_DST/webapp-list" 2>/dev/null | awk 'NR>1 && NF {print $1}' || true)
+fi
+
+echo "webapp-uninstall will remove the webapp-kit toolkit:"
+echo "  - code:            $BIN_DST"
+echo "  - shell PATH lines pointing at it"
+echo "  - Plasma session PATH file (if ours)"
+if [[ "$PURGE" == "true" ]]; then
+  echo "  - EVERY webapp and its isolated data:"
+  if ((${#PURGE_APPS[@]} == 0)); then
+    echo "      (none installed)"
+  else
+    for a in "${PURGE_APPS[@]}"; do echo "      - $a"; done
+  fi
+else
+  echo "KEPT (your apps keep working until removed): profiles, desktops,"
+  echo "icons, KWin rules. Delete one app with: webapp-remove [name]"
+fi
+
+if [[ "$YES" != "true" ]]; then
+  if [[ "$PURGE" == "true" ]]; then
+    printf 'Wipe EVERYTHING irreversibly? [y/N]> '
+  else
+    printf 'Delete toolkit but keep my apps? [y/N]> '
+  fi
+  IFS= read -r answer || answer=""
+  case "$answer" in
+    y | Y | yes | YES) ;;
+    *)
+      echo "Aborted."
+      exit 1
+      ;;
+  esac
+fi
+
+# 1. Per-app purge while helpers still exist.
+if [[ "$PURGE" == "true" && -x "$BIN_DST/webapp-remove" ]]; then
+  for a in ${PURGE_APPS[@]+"${PURGE_APPS[@]}"}; do
+    "$BIN_DST/webapp-remove" --purge "$a" >/dev/null 2>&1 || true
+  done
+fi
+
+# 2. Toolkit code + version stamp.
+rm -rf "$BIN_DST"
+rm -f "$PREFIX/VERSION"
+
+# 3. Shell PATH lines (exactly ours).
+for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+  [[ -f "$rc" ]] || continue
+  tmp="$(mktemp)"
+  grep -v -F -e "$BIN_DST:" -e ".local/share/webapps/bin:" "$rc" >"$tmp" || true
+  cat "$tmp" >"$rc"
+  rm -f "$tmp"
+done
+
+# 4. Plasma session PATH file (only if it is ours).
+ENV_FILE="$HOME/.config/plasma-workspace/env/local-bin-path.sh"
+if [[ -f "$ENV_FILE" ]] && grep -q "webapp" "$ENV_FILE" 2>/dev/null; then
+  rm -f "$ENV_FILE"
+fi
+
+echo "Uninstalled webapp-kit."
+if [[ "$PURGE" != "true" ]]; then
+  echo "Your apps and their data were kept."
+fi

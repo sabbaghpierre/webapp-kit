@@ -1,0 +1,337 @@
+#!/usr/bin/env bash
+# webapp-create — create an isolated webapp launcher (Omarchy-style) for Void/KDE.
+#
+# What it does (mirrors `omarchy-webapp-install`):
+#   1. Takes name + URL (+ engine + icon), prompting interactively if missing.
+#   2. Fetches the site favicon automatically, else asks for a PNG icon URL.
+#   3. Writes ~/.local/share/applications/<Name>.desktop with an isolated
+#      launcher Exec (per-app Chrome data dir OR per-app Firefox profile).
+#   The app then shows up in Kickoff/KRunner like any native app.
+#
+# Usage:
+#   webapp-create                                        # fully interactive
+#   webapp-create --name "ChatGPT" --url "https://chatgpt.com" --engine chrome
+#   webapp-create "ChatGPT" "https://chatgpt.com" chrome "https://.../icon.png" "x-scheme-handler/mailto"
+#   Flags: --name --url --engine(chrome|firefox) --icon(URL|file) --mime(MimeType) --exec(custom Exec)
+set -euo pipefail
+
+# Never inherit a hostile field separator/glob config (an IFS without space
+# silently disables word splitting; GLOBIGNORE can empty globs).
+unset IFS GLOBIGNORE
+
+# --version source of truth: $PREFIX/VERSION shipped by install.sh.
+cmd_version() {
+  local d
+  d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [[ -f "$d/../VERSION" ]]; then
+    cat "$d/../VERSION"
+  else
+    printf 'dev'
+  fi
+}
+
+ICON_DIR="$HOME/.local/share/applications/icons"
+DESKTOP_DIR="$HOME/.local/share/applications"
+
+APP_NAME=""
+APP_URL=""
+ICON_REF=""
+ENGINE=""
+MIME_TYPES=""
+CUSTOM_EXEC=""
+
+usage() {
+  sed -n '2,/^[^#]/p' "$0" | sed '$d; s/^# \{0,1\}//'
+}
+
+has_gum() { command -v gum >/dev/null 2>&1; }
+
+slugify() {
+  local s="$1"
+  s="${s// /-}"
+  s="$(printf '%s' "$s" | tr -c '[:alnum:]-_.' '-')"
+  s="$(printf '%s' "$s" | sed -e 's/-\{2,\}/-/g' -e 's/^[-.]//' -e 's/[-.]$//')"
+  [[ -z "$s" ]] && s="webapp"
+  printf '%s' "$s"
+}
+
+is_engine_token() {
+  case "$1" in
+    chrome | chromium | firefox | ff) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# A MIME type (e.g. x-scheme-handler/mailto) vs a custom Exec command:
+# MIME has type/subtype form with no spaces and no %u placeholder.
+looks_like_mime() {
+  [[ "$1" == *"/"* && "$1" != *" "* && "$1" != *"%u"* ]]
+}
+
+normalize_engine() {
+  case "$1" in
+    chrome | chromium) printf 'chrome' ;;
+    firefox | ff) printf 'firefox' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+prompt_input() { # $1=prompt $2=placeholder -> stdout
+  if has_gum; then
+    gum input --prompt "$1> " --placeholder "$2"
+  else
+    printf '%s> ' "$1" >&2
+    IFS= read -r reply || reply=""
+    printf '%s' "$reply"
+  fi
+}
+
+# ---- parse flags ----
+POS=()
+while (($# > 0)); do
+  case "$1" in
+    --name) APP_NAME="${2:?--name needs a value}"; shift 2 ;;
+    --url) APP_URL="${2:?--url needs a value}"; shift 2 ;;
+    --icon) ICON_REF="${2:?--icon needs a value}"; shift 2 ;;
+    --engine) ENGINE="${2:?--engine needs a value}"; shift 2 ;;
+    --mime | --mime-types) MIME_TYPES="${2:?--mime needs a value}"; shift 2 ;;
+    --exec) CUSTOM_EXEC="${2:?--exec needs a value}"; shift 2 ;;
+    -h | --help) usage; exit 0 ;;
+    --version) printf '%s %s\n' "$(basename "$0")" "$(cmd_version)"; exit 0 ;;
+    --) shift; while (($# > 0)); do POS+=("$1"); shift; done; break ;;
+    --*) echo "webapp-create: unknown flag: $1" >&2; usage >&2; exit 1 ;;
+    *) POS+=("$1"); shift ;;
+  esac
+done
+
+# ---- positional fallback (Omarchy order: name url [icon] [custom-exec] [mime],
+#      with engine accepted in slot 3 or 4) ----
+if ((${#POS[@]} > 0)) && [[ -z "$APP_NAME" ]]; then APP_NAME="${POS[0]}"; fi
+if ((${#POS[@]} > 1)) && [[ -z "$APP_URL" ]]; then APP_URL="${POS[1]}"; fi
+p3="${POS[2]:-}"; p4="${POS[3]:-}"; p5="${POS[4]:-}"; p6="${POS[5]:-}"
+if [[ -n "$p6" ]]; then echo "webapp-create: too many positional args" >&2; usage >&2; exit 1; fi
+# Engine may sit in any of slots 3-5; remaining tokens keep Omarchy order:
+# icon, custom-exec, mime-types.
+rest=()
+for tok in "$p3" "$p4" "$p5"; do
+  [[ -n "$tok" ]] || continue
+  if is_engine_token "$tok" && [[ -z "$ENGINE" ]]; then ENGINE="$tok"; else rest+=("$tok"); fi
+done
+if ((${#rest[@]} > 0)) && [[ -z "$ICON_REF" ]]; then ICON_REF="${rest[0]}"; fi
+if ((${#rest[@]} > 1)); then
+  if looks_like_mime "${rest[1]}" && [[ -z "$MIME_TYPES" ]]; then
+    MIME_TYPES="${rest[1]}"
+  elif [[ -z "$CUSTOM_EXEC" ]]; then
+    CUSTOM_EXEC="${rest[1]}"
+  fi
+fi
+if ((${#rest[@]} > 2)) && [[ -z "$MIME_TYPES" ]]; then MIME_TYPES="${rest[2]}"; fi
+if ((${#rest[@]} > 3)); then echo "webapp-create: too many positional args" >&2; usage >&2; exit 1; fi
+
+INTERACTIVE_MODE=false
+if [[ -z "$APP_NAME" || -z "$APP_URL" || -z "$ENGINE" ]]; then INTERACTIVE_MODE=true; fi
+
+# ---- interactive prompts for anything missing ----
+if [[ -z "$APP_NAME" ]]; then
+  if has_gum; then echo -e "\e[32mLet's create a new web app you can start with your app launcher.\n\e[0m"; fi
+  APP_NAME="$(prompt_input "Name" "My favorite web app")"
+fi
+if [[ -z "$APP_URL" ]]; then
+  APP_URL="$(prompt_input "URL" "https://example.com")"
+fi
+if [[ ! "$APP_URL" =~ ^[a-zA-Z][a-zA-Z0-9+.-]*: ]]; then
+  APP_URL="https://$APP_URL"
+fi
+if [[ -z "$ENGINE" ]]; then
+  if has_gum; then
+    ENGINE="$(gum choose --header "Engine? (chrome = --app window, firefox = minimal-UI profile)" "chrome" "firefox")"
+  else
+    echo "Engine? (isolated per-app data in both cases)" >&2
+    echo "  1) chrome  (--app SSB window)" >&2
+    echo "  2) firefox (dedicated profile + hidden toolbars)" >&2
+    printf 'Choice [1/2]> ' >&2
+    IFS= read -r choice || choice=""
+    case "$choice" in
+      2 | firefox | ff) ENGINE="firefox" ;;
+      *) ENGINE="chrome" ;;
+    esac
+  fi
+fi
+ENGINE="$(normalize_engine "$ENGINE")"
+if [[ "$ENGINE" != "chrome" && "$ENGINE" != "firefox" ]]; then
+  echo "webapp-create: engine must be 'chrome' or 'firefox', got '$ENGINE'" >&2
+  exit 1
+fi
+
+if [[ -z "$APP_NAME" || -z "$APP_URL" ]]; then
+  echo "webapp-create: you must set app name and app URL!" >&2
+  exit 1
+fi
+
+SLUG="$(slugify "$APP_NAME")"
+# Freedesktop-canonical icon storage: hicolor theme + bare Icon name.
+# (Absolute-path Icon= values have taskmanager-specific rendering quirks.)
+HICOLOR_DIR="$HOME/.local/share/icons/hicolor/128x128/apps"
+
+mkdir -p "$ICON_DIR" "$DESKTOP_DIR" "$HICOLOR_DIR"
+
+TMP_ICON=""
+cleanup_tmp_icon() { [[ -n "${TMP_ICON:-}" ]] && rm -f "$TMP_ICON" || true; }
+trap cleanup_tmp_icon EXIT
+
+# ---- favicon auto-fetch first (Omarchy behavior), prompt only on failure ----
+ICON_SRC=""
+if [[ -z "$ICON_REF" ]]; then
+  FAVICON_URL="https://www.google.com/s2/favicons?domain=${APP_URL}&sz=128"
+  TMP_ICON="$(mktemp /tmp/webapp-icon-XXXXXX.png)"
+  if curl -fsSL -o "$TMP_ICON" "$FAVICON_URL" 2>/dev/null && [[ -s "$TMP_ICON" ]]; then
+    ICON_SRC="$TMP_ICON"
+  elif [[ "$INTERACTIVE_MODE" == "true" ]]; then
+    ICON_REF="$(prompt_input "Icon URL" "Could not fetch favicon automatically. Enter PNG icon URL (see https://dashboardicons.com)")"
+  else
+    echo "webapp-create: could not fetch favicon automatically; pass --icon <png-url-or-file>" >&2
+    exit 1
+  fi
+fi
+
+# ---- resolve icon to a source file ----
+if [[ -z "$ICON_SRC" ]]; then
+  if [[ "$ICON_REF" =~ ^https?:// ]]; then
+    if [[ -z "$TMP_ICON" ]]; then TMP_ICON="$(mktemp /tmp/webapp-icon-XXXXXX.png)"; fi
+    if ! curl -fsSL -o "$TMP_ICON" "$ICON_REF" || [[ ! -s "$TMP_ICON" ]]; then
+      echo "webapp-create: error: failed to download icon." >&2
+      exit 1
+    fi
+    ICON_SRC="$TMP_ICON"
+  elif [[ -f "$ICON_REF" ]]; then
+    ICON_SRC="$ICON_REF"
+  elif [[ -f "$ICON_DIR/$ICON_REF" ]]; then
+    ICON_SRC="$ICON_DIR/$ICON_REF"
+  else
+    echo "webapp-create: error: icon file not found: $ICON_REF" >&2
+    exit 1
+  fi
+fi
+
+# Sanity: refuse non-images (keeps error pages out of the icon theme).
+if command -v file >/dev/null 2>&1 && ! file -b "$ICON_SRC" | grep -qi 'image'; then
+  echo "webapp-create: error: icon is not an image: $ICON_SRC ($(file -b "$ICON_SRC"))" >&2
+  exit 1
+fi
+
+# ---- install into the hicolor theme under the slug name ----
+cp -f "$ICON_SRC" "$HICOLOR_DIR/$SLUG.png"
+chmod 644 "$HICOLOR_DIR/$SLUG.png"
+ICON_VALUE="$SLUG"
+
+# ---- engine sanity warnings (non-fatal) ----
+if [[ "$ENGINE" == "chrome" ]] && ! command -v google-chrome-stable >/dev/null 2>&1 && ! command -v google-chrome >/dev/null 2>&1 && ! command -v chromium >/dev/null 2>&1 && ! command -v chromium-browser >/dev/null 2>&1 && ! command -v brave-browser >/dev/null 2>&1 && ! command -v brave >/dev/null 2>&1 && ! command -v vivaldi-stable >/dev/null 2>&1; then
+  echo "webapp-create: warning: no Chromium-based browser found; install google-chrome or chromium for the 'chrome' engine." >&2
+fi
+if [[ "$ENGINE" == "firefox" ]] && ! command -v firefox >/dev/null 2>&1; then
+  echo "webapp-create: warning: firefox not found on PATH." >&2
+fi
+
+# ---- Exec line (absolute launcher path: Plasma/KRunner do NOT inherit
+# the toolkit dir from .bashrc, so a bare command name fails to resolve) ----
+# (SLUG was computed in the icon section above.)
+LAUNCHER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Helpers (optional — install proceeds without them).
+KWIN_HELPER="$LAUNCHER_DIR/webapp-kwin.sh"
+[[ -f "$KWIN_HELPER" ]] || KWIN_HELPER="$HOME/.local/share/webapps/bin/webapp-kwin.sh"
+if [[ -f "$KWIN_HELPER" ]]; then
+  # shellcheck disable=SC1090
+  source "$KWIN_HELPER"
+fi
+ENV_HELPER="$LAUNCHER_DIR/webapp-env.sh"
+[[ -f "$ENV_HELPER" ]] || ENV_HELPER="$HOME/.local/share/webapps/bin/webapp-env.sh"
+if [[ -f "$ENV_HELPER" ]]; then
+  # shellcheck disable=SC1090
+  source "$ENV_HELPER"
+fi
+# compositor(): plasma|niri|hyprland|sway|gnome|unknown (plasma if undetectable).
+compositor() {
+  if declare -F webapp_compositor >/dev/null 2>&1; then
+    webapp_compositor
+  else
+    printf 'plasma'
+  fi
+}
+# Chromium ignores --class with --app=, so windows report a derived id
+# (chrome-<host>__-Default). Match THAT for taskbar/titlebar icons.
+WM_MATCH="$SLUG"
+if [[ "$ENGINE" == "chrome" ]] && declare -F webapp_chrome_id >/dev/null 2>&1; then
+  WM_MATCH="$(webapp_chrome_id "$APP_URL")"
+fi
+if [[ -n "$CUSTOM_EXEC" ]]; then
+  EXEC_COMMAND="$CUSTOM_EXEC"
+else
+  if [[ "$ENGINE" == "chrome" ]]; then
+    EXEC_COMMAND="$LAUNCHER_DIR/webapp-launch-chrome --name \"$APP_NAME\" --url \"$APP_URL\""
+  else
+    EXEC_COMMAND="$LAUNCHER_DIR/webapp-launch-firefox --name \"$APP_NAME\" --url \"$APP_URL\""
+  fi
+  if [[ -n "$MIME_TYPES" && "$EXEC_COMMAND" != *"%u"* ]]; then
+    EXEC_COMMAND="$EXEC_COMMAND %u"
+  fi
+fi
+
+DESKTOP_FILE="$DESKTOP_DIR/$APP_NAME.desktop"
+cat >"$DESKTOP_FILE" <<EOF
+[Desktop Entry]
+Version=1.0
+Name=$APP_NAME
+Comment=$APP_NAME (webapp, $ENGINE, isolated)
+Exec=$EXEC_COMMAND
+Terminal=false
+Type=Application
+Icon=$ICON_VALUE
+StartupNotify=true
+StartupWMClass=$WM_MATCH
+EOF
+
+if [[ -n "$MIME_TYPES" ]]; then
+  # Ensure trailing semicolon per spec.
+  [[ "$MIME_TYPES" == *";" ]] || MIME_TYPES="${MIME_TYPES};"
+  echo "MimeType=$MIME_TYPES" >>"$DESKTOP_FILE"
+fi
+
+chmod +x "$DESKTOP_FILE"
+
+# Refresh KDE's app index if available; never fail the install on this.
+if command -v kbuildsycoca6 >/dev/null 2>&1; then
+  kbuildsycoca6 >/dev/null 2>&1 || true
+fi
+if command -v update-desktop-database >/dev/null 2>&1; then
+  update-desktop-database "$DESKTOP_DIR" >/dev/null 2>&1 || true
+fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+  gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" >/dev/null 2>&1 || true
+fi
+
+# KWin rule forcing window -> .desktop association (Plasma only; other
+# compositors match natively via app_id + StartupWMClass).
+# Chrome regex covers both worlds: slug (--class, if honored) and Chromium's
+# derived id (--class ignored, the common case). Firefox: slug matches the
+# --name app_id the launcher sets (plus StartupWMClass); the rule is
+# insurance against compositor/Firefox matching regressions.
+if [[ "$(compositor)" == "plasma" ]] && declare -F kwin_rule_add >/dev/null 2>&1; then
+  if [[ "$ENGINE" == "chrome" ]]; then
+    WM_PATTERN="($(webapp_regex_escape "$SLUG")|$(webapp_regex_escape "$WM_MATCH"))"
+  else
+    WM_PATTERN="($(webapp_regex_escape "$SLUG"))"
+  fi
+  kwin_rule_add "$APP_NAME" "$APP_NAME" "$WM_PATTERN"
+  kwin_reconfigure || true
+fi
+
+echo "Created '$APP_NAME' ($ENGINE, isolated). Find it in your app launcher."
+echo "Note: isolated profile — log in once inside the webapp window."
+if ! command -v gum >/dev/null 2>&1; then
+  if declare -F webapp_install_cmd >/dev/null 2>&1; then
+    GUM_TIP="$(webapp_install_cmd gum)"
+    [[ -n "$GUM_TIP" ]] && echo "Tip: $GUM_TIP  (for the Omarchy-style interactive prompts)"
+  else
+    echo "Tip: sudo xbps-install -S gum  (for the Omarchy-style interactive prompts)"
+  fi
+fi

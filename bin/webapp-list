@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# webapp-list — list installed isolated webapps.
+# Usage: webapp-list [-h|--help] [--json]
+#   --json emits [{"name","engine","url","desktop"}] for machine consumers.
+set -euo pipefail
+
+# Never inherit a hostile field separator/glob config.
+unset IFS GLOBIGNORE
+
+# --version source of truth: $PREFIX/VERSION shipped by install.sh.
+cmd_version() {
+  local d
+  d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [[ -f "$d/../VERSION" ]]; then
+    cat "$d/../VERSION"
+  else
+    printf 'dev'
+  fi
+}
+
+if [[ "${1:-}" == "--version" ]]; then
+  printf '%s %s\n' "$(basename "$0")" "$(cmd_version)"
+  exit 0
+fi
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  echo "Usage: webapp-list [--json]   (lists installed webapps; see webapp-help for the full toolkit)"
+  exit 0
+fi
+
+JSON=false
+if [[ "${1:-}" == "--json" ]]; then JSON=true; fi
+
+DESKTOP_DIR="$HOME/.local/share/applications"
+
+json_escape() {
+  # minimal JSON string escaper for single-line fields
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\000-\037'
+}
+
+first=true
+found=0
+if [[ "$JSON" == "true" ]]; then printf '['; else printf '%-24s %-8s %s\n' "NAME" "ENGINE" "URL"; fi
+while IFS= read -r -d '' file; do
+  exec_line="$(grep -m1 '^Exec=' "$file" || true)"
+  [[ "$exec_line" == *"webapp-launch-"* ]] || continue
+  name="$(basename "${file%.desktop}")"
+  engine="custom"
+  [[ "$exec_line" == *"webapp-launch-chrome"* ]] && engine="chrome"
+  [[ "$exec_line" == *"webapp-launch-firefox"* ]] && engine="firefox"
+  url="$(printf '%s' "$exec_line" | sed -n 's/.*--url[ "]*\([^ "]*\).*/\1/p')"
+  if [[ -z "$url" ]]; then
+    url="$(printf '%s' "$exec_line" | grep -oE 'https?://[^ "]*' | head -n1 || true)"
+  fi
+  if [[ -z "$url" ]]; then
+    url="(custom exec)"
+  fi
+  if [[ "$JSON" == "true" ]]; then
+    $first || printf ','
+    first=false
+    printf '{"name":"%s","engine":"%s","url":"%s","desktop":"%s"}' \
+      "$(json_escape "$name")" "$engine" "$(json_escape "$url")" "$(json_escape "$file")"
+  else
+    printf '%-24s %-8s %s\n' "$name" "$engine" "$url"
+  fi
+  found=1
+done < <(find "$DESKTOP_DIR" -maxdepth 1 -name '*.desktop' -print0 2>/dev/null)
+if [[ "$JSON" == "true" ]]; then printf ']\n'; fi
+
+if [[ "$found" == "0" && "$JSON" != "true" ]]; then
+  echo "(no webapps installed)"
+fi

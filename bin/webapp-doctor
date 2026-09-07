@@ -1,0 +1,614 @@
+#!/usr/bin/env bash
+# webapp-doctor — diagnose a webapp installation end to end.
+#
+# Checks, per app: .desktop fields, launcher presence, icon file, profile dir,
+# stylesheet version, KWin rule, and whether a live process matches.
+# Also flags orphans (data/rules without a .desktop).
+#
+# Usage: webapp-doctor [name...]   (no args: check all webapps + orphans)
+#        webapp-doctor --probe [name]
+#   --probe samples live window info for 10s (focus the app window
+#   first). Prints window identity + matched .desktop file — the ground
+#   truth for icon issues. Backend auto-detected: KWin, niri, Hyprland,
+#   Sway (GNOME: prints Looking Glass instructions).
+#        webapp-doctor --deps
+#   --deps checks hard/soft dependencies with per-distro install hints.
+set -uo pipefail
+
+# Snapshot inherited shell state BEFORE sanitizing (for --deps diagnostics).
+INHERITED_IFS="${IFS:-__UNSET__}"
+INHERITED_GLOBIGNORE="${GLOBIGNORE:-__UNSET__}"
+# Never inherit a hostile field separator/glob config.
+unset IFS GLOBIGNORE
+
+# --version source of truth: $PREFIX/VERSION shipped by install.sh.
+cmd_version() {
+  local d
+  d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [[ -f "$d/../VERSION" ]]; then
+    cat "$d/../VERSION"
+  else
+    printf 'dev'
+  fi
+}
+
+ICON_DIR="$HOME/.local/share/applications/icons"
+DESKTOP_DIR="$HOME/.local/share/applications"
+DATA_ROOT="$HOME/.local/share/webapps"
+KWIN_RULES_FILE="$HOME/.config/kwinrulesrc"
+
+# env helpers (compositor/distro detection); optional.
+ENV_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/webapp-env.sh"
+if [[ -f "$ENV_HELPER" ]]; then
+  # shellcheck disable=SC1090
+  source "$ENV_HELPER"
+fi
+
+# compositor(): plasma|niri|hyprland|sway|gnome|unknown (plasma if undetectable,
+# preserving historical behavior for old installs without the helper).
+compositor() {
+  if declare -F webapp_compositor >/dev/null 2>&1; then
+    webapp_compositor
+  else
+    printf 'plasma'
+  fi
+}
+
+ISSUES=0
+ok() { printf '  ok: %s\n' "$*"; }
+warn() { printf '  WARN: %s\n' "$*"; ISSUES=$((ISSUES + 1)); }
+info() { printf '  info: %s\n' "$*"; }
+
+slugify() {
+  local s="$1"
+  s="${s// /-}"
+  s="$(printf '%s' "$s" | tr -c '[:alnum:]-_.' '-')"
+  s="$(printf '%s' "$s" | sed -e 's/-\{2,\}/-/g' -e 's/^[-.]//' -e 's/[-.]$//')"
+  [[ -z "$s" ]] && s="webapp"
+  printf '%s' "$s"
+}
+
+check_app() {
+  local name="$1"
+  local desktop="$DESKTOP_DIR/$name.desktop"
+  echo "== $name =="
+  if [[ ! -f "$desktop" ]]; then
+    warn "no .desktop file ($desktop)"
+    return
+  fi
+  local exec_line icon wmclass engine slug url launcher
+  exec_line="$(grep -m1 '^Exec=' "$desktop" | cut -d= -f2- || true)"
+  icon="$(grep -m1 '^Icon=' "$desktop" | cut -d= -f2- || true)"
+  wmclass="$(grep -m1 '^StartupWMClass=' "$desktop" | cut -d= -f2- || true)"
+  engine="custom"
+  [[ "$exec_line" == *"webapp-launch-chrome"* ]] && engine="chrome"
+  [[ "$exec_line" == *"webapp-launch-firefox"* ]] && engine="firefox"
+  slug="$(printf '%s' "$exec_line" | sed -n 's/.*--name "\([^"]*\)".*/\1/p;s/.*--name \([^ "]*\).*/\1/p' | head -n1 || true)"
+  [[ -z "$slug" ]] && slug="$(slugify "$name")"
+  slug="$(slugify "$slug")"
+  url="$(printf '%s' "$exec_line" | sed -n 's/.*--url "\([^"]*\)".*/\1/p;s/.*--url \([^ "]*\).*/\1/p' | head -n1 || true)"
+  launcher="$(printf '%s' "$exec_line" | awk '{print $1}')"
+
+  if [[ -x "$launcher" ]]; then ok "launcher $launcher"; else warn "launcher not executable: $launcher"; fi
+  # Resolve icon: absolute path (legacy) or theme name (hicolor).
+  icon_path="$icon"
+  if [[ -n "$icon" && "$icon" != */* ]]; then
+    for cand in "$HOME/.local/share/icons/hicolor/128x128/apps/$icon.png" \
+      "$HOME/.local/share/icons/hicolor/128x128/apps/$icon" \
+      "$HOME/.local/share/icons/$icon.png" "$ICON_DIR/$icon.png"; do
+      if [[ -f "$cand" ]]; then icon_path="$cand"; break; fi
+    done
+  fi
+  if [[ "$icon" == */* && "$icon" != /* ]]; then
+    warn "legacy relative icon path (migrate to hicolor: recreate the app)"
+  fi
+  if [[ -n "$icon_path" && -f "$icon_path" ]]; then
+    if command -v file >/dev/null 2>&1 && ! file -b "$icon_path" | grep -qi image; then
+      warn "icon is not an image: $icon_path ($(file -b "$icon_path"))"
+    else
+      ok "icon $icon -> $icon_path"
+    fi
+  else
+    warn "icon missing: ${icon:-(none set)}"
+  fi
+  if [[ -n "$wmclass" ]]; then ok "StartupWMClass=$wmclass"; else warn "no StartupWMClass"; fi
+  if command -v desktop-file-validate >/dev/null 2>&1; then
+    if desktop-file-validate "$desktop" 2>/dev/null; then ok "desktop-file-validate"; else warn "desktop-file-validate failed"; fi
+  fi
+
+  if [[ "$engine" == "chrome" ]]; then
+    if [[ -d "$DATA_ROOT/chrome-${slug}" ]]; then ok "data dir $DATA_ROOT/chrome-${slug}"; else info "data dir not created yet (first launch creates it)"; fi
+  elif [[ "$engine" == "firefox" ]]; then
+    local pdir="$DATA_ROOT/firefox-${slug}"
+    if [[ -d "$pdir" ]]; then
+      ok "profile dir $pdir"
+      if grep -qF 'toolkit.legacyUserProfileCustomizations.stylesheets' "$pdir/user.js" 2>/dev/null; then
+        ok "stylesheets pref set"
+      else
+        warn "stylesheets pref missing in $pdir/user.js (CSS will not apply)"
+      fi
+      if [[ -f "$pdir/chrome/userChrome.css" ]]; then
+        if grep -q 'webapp minimal UI v3' "$pdir/chrome/userChrome.css" 2>/dev/null; then
+          ok "userChrome.css v3 (window controls kept)"
+        elif grep -q 'auto-generated by webapp-launch-firefox' "$pdir/chrome/userChrome.css" 2>/dev/null; then
+          warn "userChrome.css is v1/v2 (hides titlebar); relaunch to migrate"
+        else
+          info "custom userChrome.css (managed by you)"
+        fi
+      else
+        warn "no chrome/userChrome.css (relaunch to seed it)"
+      fi
+    else
+      info "profile dir not created yet (first launch creates it)"
+    fi
+    # Legacy named-profile leftovers from before ice-style dirs.
+    if ls -d "$HOME"/.config/mozilla/firefox/*."${slug}-webapp" "$HOME"/.mozilla/firefox/*."${slug}-webapp" >/dev/null 2>&1; then
+      warn "legacy named profile(s) *.$slug-webapp still exist (safe to delete once the new dir works)"
+    fi
+  else
+    info "custom Exec, skipping engine checks"
+  fi
+
+  local comp dupes
+  comp="$(compositor)"
+  if [[ "$comp" != "plasma" ]]; then
+    info "not on Plasma (compositor: $comp); native app_id matching applies, no KWin rule needed"
+  elif [[ -f "$KWIN_RULES_FILE" ]] && grep -q "^desktopfile=$name$" "$KWIN_RULES_FILE"; then
+    ok "KWin rule present (desktopfile=$name)"
+  else
+    warn "no KWin rule for desktopfile=$name (taskbar icon matching degraded)"
+  fi
+  dupes=0
+  if [[ "$comp" == "plasma" && -f "$KWIN_RULES_FILE" ]]; then
+    dupes="$(KWEX_T="$name" awk '
+    /^\[.*\]$/ {
+      if (cur != "" && has_df && has_m) n++
+      cur = $0; has_df = 0; has_m = 0; next
+    }
+    $0 == ("desktopfile=" ENVIRON["KWEX_T"]) { has_df = 1; next }
+    /^Description=webapp: / { has_m = 1; next }
+    END { if (cur != "" && has_df && has_m) n++; print n + 0 }
+  ' "$KWIN_RULES_FILE" 2>/dev/null || echo 0)"
+  fi
+  if [[ "$dupes" -gt 1 ]]; then
+    warn "$dupes duplicate KWin rules for desktopfile=$name (recreate dedupes; remove + recreate to clean)"
+  fi
+
+  # Snapshot ps first: grepping the live ps output would match grep itself.
+  procs="$(ps -eo args 2>/dev/null || true)"
+  if printf '%s' "$procs" | grep -F -q -- "--name $slug"; then
+    ok "live process with --name $slug"
+  else
+    info "no live process (app not running)"
+  fi
+  if [[ -f "$DATA_ROOT/${slug}.log" ]]; then
+    info "last log: $(tail -n1 "$DATA_ROOT/${slug}.log" 2>/dev/null)"
+  fi
+}
+
+json_escape() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\000-\037'
+}
+
+# check_app_json <name>: machine-readable twin of check_app. Emits one JSON
+# object on stdout; appends warning strings to global JSON_ISSUES array.
+JSON_ISSUES=()
+check_app_json() {
+  local name="$1"
+  local desktop="$DESKTOP_DIR/$name.desktop"
+  local -a issues=()
+  local exec_line icon wmclass engine slug url launcher icon_path
+  local desktop_valid="" profile_dir="" css_version="n/a" kwin_rule=false live=false log_tail=""
+  if [[ ! -f "$desktop" ]]; then
+    issues+=("no .desktop file ($desktop)")
+  else
+    exec_line="$(grep -m1 '^Exec=' "$desktop" | cut -d= -f2- || true)"
+    icon="$(grep -m1 '^Icon=' "$desktop" | cut -d= -f2- || true)"
+    wmclass="$(grep -m1 '^StartupWMClass=' "$desktop" | cut -d= -f2- || true)"
+    engine="custom"
+    [[ "$exec_line" == *"webapp-launch-chrome"* ]] && engine="chrome"
+    [[ "$exec_line" == *"webapp-launch-firefox"* ]] && engine="firefox"
+    slug="$(printf '%s' "$exec_line" | sed -n 's/.*--name "\([^"]*\)".*/\1/p;s/.*--name \([^ "]*\).*/\1/p' | head -n1 || true)"
+    [[ -z "$slug" ]] && slug="$(slugify "$name")"
+    slug="$(slugify "$slug")"
+    url="$(printf '%s' "$exec_line" | sed -n 's/.*--url "\([^"]*\)".*/\1/p;s/.*--url \([^ "]*\).*/\1/p' | head -n1 || true)"
+    launcher="$(printf '%s' "$exec_line" | awk '{print $1}')"
+    [[ -x "$launcher" ]] || issues+=("launcher not executable: $launcher")
+    icon_path="$icon"
+    if [[ -n "$icon" && "$icon" != */* ]]; then
+      for cand in "$HOME/.local/share/icons/hicolor/128x128/apps/$icon.png" \
+        "$HOME/.local/share/icons/hicolor/128x128/apps/$icon" \
+        "$HOME/.local/share/icons/$icon.png" "$ICON_DIR/$icon.png"; do
+        if [[ -f "$cand" ]]; then icon_path="$cand"; break; fi
+      done
+    fi
+    [[ "$icon" == */* && "$icon" != /* ]] && issues+=("legacy relative icon path")
+    if [[ -n "$icon_path" && -f "$icon_path" ]]; then
+      if command -v file >/dev/null 2>&1 && ! file -b "$icon_path" | grep -qi image; then
+        issues+=("icon is not an image: $icon_path")
+      fi
+    else
+      issues+=("icon missing: ${icon:-(none set)}")
+    fi
+    [[ -z "$wmclass" ]] && issues+=("no StartupWMClass")
+    if command -v desktop-file-validate >/dev/null 2>&1; then
+      if desktop-file-validate "$desktop" 2>/dev/null; then desktop_valid=true; else desktop_valid=false; issues+=("desktop-file-validate failed"); fi
+    fi
+    if [[ "$engine" == "chrome" ]]; then
+      [[ -d "$DATA_ROOT/chrome-${slug}" ]] && profile_dir="$DATA_ROOT/chrome-${slug}"
+    elif [[ "$engine" == "firefox" ]]; then
+      if [[ -d "$DATA_ROOT/firefox-${slug}" ]]; then
+        profile_dir="$DATA_ROOT/firefox-${slug}"
+        grep -qF 'toolkit.legacyUserProfileCustomizations.stylesheets' "$profile_dir/user.js" 2>/dev/null \
+          || issues+=("stylesheets pref missing (CSS will not apply)")
+        if [[ -f "$profile_dir/chrome/userChrome.css" ]]; then
+          if grep -q 'webapp minimal UI v3' "$profile_dir/chrome/userChrome.css" 2>/dev/null; then
+            css_version="v3"
+          elif grep -q 'auto-generated by webapp-launch-firefox' "$profile_dir/chrome/userChrome.css" 2>/dev/null; then
+            css_version="v1/v2"; issues+=("userChrome.css is v1/v2 (hides titlebar); relaunch to migrate")
+          else
+            css_version="custom"
+          fi
+        else
+          css_version="missing"; issues+=("no chrome/userChrome.css (relaunch to seed it)")
+        fi
+      fi
+      if ls -d "$HOME"/.config/mozilla/firefox/*."${slug}-webapp" "$HOME"/.mozilla/firefox/*."${slug}-webapp" >/dev/null 2>&1; then
+        issues+=("legacy named profile(s) *.$slug-webapp still exist")
+      fi
+    fi
+    local comp
+    comp="$(compositor)"
+    if [[ "$comp" == "plasma" ]]; then
+      if [[ -f "$KWIN_RULES_FILE" ]] && grep -q "^desktopfile=$name$" "$KWIN_RULES_FILE"; then
+        kwin_rule=true
+      else
+        issues+=("no KWin rule for desktopfile=$name")
+      fi
+      local dupes
+      dupes="$(KWEX_T="$name" awk '
+      /^\[.*\]$/ {
+        if (cur != "" && has_df && has_m) n++
+        cur = $0; has_df = 0; has_m = 0; next
+      }
+      $0 == ("desktopfile=" ENVIRON["KWEX_T"]) { has_df = 1; next }
+      /^Description=webapp: / { has_m = 1; next }
+      END { if (cur != "" && has_df && has_m) n++; print n + 0 }
+    ' "$KWIN_RULES_FILE" 2>/dev/null || echo 0)"
+      if [[ "$dupes" -gt 1 ]]; then issues+=("$dupes duplicate KWin rules"); fi
+    fi
+    procs="$(ps -eo args 2>/dev/null || true)"
+    if printf '%s' "$procs" | grep -F -q -- "--name $slug"; then live=true; fi
+    [[ -f "$DATA_ROOT/${slug}.log" ]] && log_tail="$(tail -n1 "$DATA_ROOT/${slug}.log" 2>/dev/null || true)"
+  fi
+  local issues_json="" it
+  for it in ${issues[@]+"${issues[@]}"}; do
+    [[ -n "$issues_json" ]] && issues_json="$issues_json,"
+    issues_json="$issues_json\"$(json_escape "$it")\""
+  done
+  JSON_ISSUES+=(${issues[@]+"${issues[@]}"})
+  printf '{"name":"%s","engine":"%s","url":"%s","desktop":"%s","icon":"%s","icon_path":"%s","startup_wmclass":"%s","desktop_valid":%s,"profile_dir":"%s","css_version":"%s","kwin_rule":%s,"live":%s,"log_tail":"%s","issues":[%s]}' \
+    "$(json_escape "$name")" "$engine" "$(json_escape "$url")" "$(json_escape "$desktop")" \
+    "$(json_escape "$icon")" "$(json_escape "$icon_path")" "$(json_escape "$wmclass")" \
+    "${desktop_valid:-null}" "$(json_escape "$profile_dir")" "$css_version" "$kwin_rule" "$live" \
+    "$(json_escape "$log_tail")" "$issues_json"
+}
+
+check_orphans() {  local d base found=0
+  for d in "$DATA_ROOT"/firefox-* "$DATA_ROOT"/chrome-*; do
+    [[ -e "$d" ]] || continue
+    base="$(basename "$d")"
+    # dir names are <engine>-<slug>; find desktop whose slug matches
+    found=0
+    while IFS= read -r -d '' f; do
+      if grep -q '^Exec=.*webapp-launch-' "$f" 2>/dev/null; then
+        n="$(basename "${f%.desktop}")"
+        if [[ "$(slugify "$n")" == "${base#*-}" ]]; then found=1; break; fi
+      fi
+    done < <(find "$DESKTOP_DIR" -maxdepth 1 -name '*.desktop' -print0 2>/dev/null)
+    if [[ "$found" == "0" ]]; then warn "orphan data dir without .desktop: $d"; fi
+  done
+  # legacy named profiles
+  for d in "$HOME"/.config/mozilla/firefox/*-webapp "$HOME"/.mozilla/firefox/*-webapp; do
+    [[ -d "$d" ]] || continue
+    warn "legacy orphan profile (pre-ice-style): $d"
+  done
+}
+
+# probe backends: one per compositor, same output contract
+# (class | desktop | pid | caption). KWin samples the focused window for 10s;
+# the tiling compositors dump their window lists once.
+probe_kwin() {
+  local expect="${1:-}"
+  command -v busctl >/dev/null 2>&1 || {
+    echo "probe: busctl not found (need dbus user tools)" >&2
+    return 1
+  }
+  echo "probe: focus the '${expect:-app}' window NOW (click it, mouse over it); sampling 10s..."
+  local i out rc df pid cap
+  for i in $(seq 1 10); do
+    out="$(busctl --user call org.kde.KWin /KWin org.kde.KWin queryWindowInfo 2>/dev/null || true)"
+    rc="$(printf '%s' "$out" | sed -n 's/.*"resourceClass" s "\([^"]*\)".*/\1/p')"
+    df="$(printf '%s' "$out" | sed -n 's/.*"desktopFile" s "\([^"]*\)".*/\1/p')"
+    pid="$(printf '%s' "$out" | sed -n 's/.*"pid" i \([0-9][0-9]*\).*/\1/p')"
+    cap="$(printf '%s' "$out" | sed -n 's/.*"caption" s "\([^"]*\)".*/\1/p')"
+    printf '  [%2ss] class=%-22s desktop=%-22s pid=%-8s caption=%.45s\n' \
+      "$i" "${rc:-(?)}" "${df:-(none)}" "${pid:-?}" "$cap"
+    if [[ -n "$expect" && "$rc" == "$expect" ]]; then
+      echo "probe: MATCH — window reports class '$rc', KWin matched desktop '${df:-(none)}'"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "probe: done — paste the rows above (looking for class '$expect' if given)"
+  return 0
+}
+
+# probe_niri: `niri msg windows` blocks look like
+#   Window ID 34:
+#     Title: "GitHub"
+#     App ID: "firefox"
+probe_niri() {
+  local expect="${1:-}"
+  command -v niri >/dev/null 2>&1 || {
+    echo "probe: niri CLI not found" >&2
+    return 1
+  }
+  local out title appid printed=0
+  out="$(niri msg windows 2>/dev/null || true)"
+  title=""; appid=""
+  while IFS= read -r line; do
+    case "$line" in
+      *Title:\ *) title="$(printf '%s' "$line" | sed -n 's/.*Title: *"\{0,1\}\([^"]*\)"\{0,1\}.*/\1/p')" ;;
+      *App\ ID:\ *)
+        appid="$(printf '%s' "$line" | sed -n 's/.*App ID: *"\{0,1\}\([^"]*\)"\{0,1\}.*/\1/p')"
+        if [[ -z "$expect" || "$appid" == "$expect" || "$title" == *"$expect"* ]]; then
+          printf '  class=%-22s title=%.60s\n' "${appid:-(?)}" "$title"
+          printed=1
+          [[ -n "$expect" && "$appid" == "$expect" ]] && echo "probe: MATCH — window reports app_id '$appid'"
+        fi
+        title=""; appid=""
+        ;;
+    esac
+  done <<<"$out"
+  if [[ "$printed" == "0" ]]; then
+    echo "probe: no niri windows matched '$expect'; full list:"
+    printf '%s\n' "$out" | grep -E "Title:|App ID:" || echo "  (no windows reported)"
+  fi
+  return 0
+}
+
+# probe_hyprland: hyprctl clients -j gives [{class,title,pid,...}] (class=app_id).
+probe_hyprland() {
+  local expect="${1:-}"
+  command -v hyprctl >/dev/null 2>&1 || {
+    echo "probe: hyprctl not found" >&2
+    return 1
+  }
+  command -v jq >/dev/null 2>&1 || {
+    echo "probe: jq not found (needed to parse hyprctl JSON)" >&2
+    return 1
+  }
+  local rows
+  rows="$(hyprctl clients -j 2>/dev/null | jq -r '.[] | "\(.class)\t\(.title)\t\(.pid)"' 2>/dev/null || true)"
+  if [[ -z "$rows" ]]; then echo "probe: no Hyprland clients reported"; return 0; fi
+  local printed=0 class title pid
+  while IFS=$'\t' read -r class title pid; do
+    if [[ -z "$expect" || "$class" == "$expect" || "$title" == *"$expect"* ]]; then
+      printf '  class=%-22s pid=%-8s title=%.60s\n' "$class" "$pid" "$title"
+      printed=1
+      [[ -n "$expect" && "$class" == "$expect" ]] && echo "probe: MATCH — window reports class '$class'"
+    fi
+  done <<<"$rows"
+  [[ "$printed" == "0" ]] && printf '%s\n' "$rows"
+  return 0
+}
+
+# probe_sway: swaymsg -t get_tree, walk to nodes carrying app_id.
+probe_sway() {
+  local expect="${1:-}"
+  command -v swaymsg >/dev/null 2>&1 || {
+    echo "probe: swaymsg not found" >&2
+    return 1
+  }
+  command -v jq >/dev/null 2>&1 || {
+    echo "probe: jq not found (needed to parse swaymsg JSON)" >&2
+    return 1
+  }
+  local rows
+  rows="$(swaymsg -t get_tree 2>/dev/null | jq -r '.. | objects | select(has("app_id")) | "\(.app_id)\t\(.name)\t\(.pid)"' 2>/dev/null || true)"
+  if [[ -z "$rows" ]]; then echo "probe: no Sway windows reported"; return 0; fi
+  local printed=0 class title pid
+  while IFS=$'\t' read -r class title pid; do
+    if [[ -z "$expect" || "$class" == "$expect" || "$title" == *"$expect"* ]]; then
+      printf '  class=%-22s pid=%-8s title=%.60s\n' "$class" "$pid" "$title"
+      printed=1
+      [[ -n "$expect" && "$class" == "$expect" ]] && echo "probe: MATCH — window reports class '$class'"
+    fi
+  done <<<"$rows"
+  [[ "$printed" == "0" ]] && printf '%s\n' "$rows"
+  return 0
+}
+
+probe_gnome() {
+  echo "probe: GNOME exposes no window-identity CLI."
+  echo "  Press Alt+F2, type: lg   → Windows tab → read the WMClass column"
+  echo "  for your app window and compare it to StartupWMClass in its .desktop file."
+  return 0
+}
+
+probe() {
+  local expect="${1:-}" comp
+  comp="$(compositor)"
+  case "$comp" in
+    plasma) probe_kwin "$expect" ;;
+    niri) probe_niri "$expect" ;;
+    hyprland) probe_hyprland "$expect" ;;
+    sway) probe_sway "$expect" ;;
+    gnome) probe_gnome ;;
+    *)
+      echo "probe: unknown compositor; trying KWin, then niri..."
+      if busctl --user call org.kde.KWin /KWin org.kde.KWin queryWindowInfo >/dev/null 2>&1; then
+        probe_kwin "$expect"
+      elif command -v niri >/dev/null 2>&1; then
+        probe_niri "$expect"
+      else
+        echo "probe: no supported compositor interface found" >&2
+        return 1
+      fi
+      ;;
+  esac
+}
+
+# deps: hard vs soft dependency report with per-distro install hints.
+deps() {
+  local missing_hard="" c hint
+  echo "== hard dependencies (webapps break without these) =="
+  for c in bash curl setsid; do
+    if command -v "$c" >/dev/null 2>&1; then
+      printf '  ok: %s\n' "$c"
+    else
+      printf '  MISSING: %s\n' "$c"; missing_hard="$missing_hard $c"
+    fi
+  done
+  if command -v firefox >/dev/null 2>&1; then
+    printf '  ok: firefox (%s engine)\n' "$(command -v firefox)"
+  elif command -v google-chrome-stable >/dev/null 2>&1 || command -v google-chrome >/dev/null 2>&1 || command -v chromium >/dev/null 2>&1 || command -v chromium-browser >/dev/null 2>&1 || command -v brave-browser >/dev/null 2>&1 || command -v brave >/dev/null 2>&1 || command -v vivaldi-stable >/dev/null 2>&1; then
+    printf '  ok: chromium-family browser (chrome engine)\n'
+  else
+    printf '  MISSING: no supported browser (firefox or chromium-family)\n'
+    missing_hard="$missing_hard browser"
+  fi
+  echo "== soft dependencies (features degrade gracefully without these) =="
+  for c in gum file jq kwriteconfig6 kbuildsycoca6 update-desktop-database gtk-update-icon-cache desktop-file-validate busctl; do
+    if command -v "$c" >/dev/null 2>&1; then
+      printf '  ok: %s\n' "$c"
+    else
+      printf '  missing (optional): %s\n' "$c"
+    fi
+  done
+  printf '  distro: %s | compositor: %s\n' "$(declare -F webapp_distro >/dev/null 2>&1 && webapp_distro || echo unknown)" "$(compositor)"
+  echo "== shell environment sanity (inherited, before scripts sanitize) =="
+  if [[ "$INHERITED_IFS" == "__UNSET__" || "$INHERITED_IFS" == *' '* ]]; then
+    echo "  ok: IFS default (word splitting intact)"
+  else
+    echo "  WARN: inherited IFS has no space — breaks unquoted expansions in"
+    echo "        ANY shell script (this installer saga started exactly here);"
+    echo "        webapp-* scripts unset IFS defensively, check your dotfiles."
+  fi
+  if [[ "$INHERITED_GLOBIGNORE" == "__UNSET__" || -z "$INHERITED_GLOBIGNORE" ]]; then
+    echo "  ok: GLOBIGNORE unset"
+  else
+    echo "  info: GLOBIGNORE is set to '$INHERITED_GLOBIGNORE' (webapp scripts are immune: find-based scans)"
+  fi
+  if [[ -n "${missing_hard// }" ]]; then
+    if declare -F webapp_install_cmd >/dev/null 2>&1; then
+      hint="$(webapp_install_cmd "${missing_hard# }")"
+      [[ -n "$hint" ]] && echo "install: $hint"
+    fi
+    return 1
+  fi
+  return 0
+}
+
+# orphans_json: emit orphan paths as a JSON string array (no warnings here;
+# caller counts them).
+orphans_json() {
+  local first=true d base found n f
+  printf '['
+  for d in "$DATA_ROOT"/firefox-* "$DATA_ROOT"/chrome-*; do
+    [[ -e "$d" ]] || continue
+    base="$(basename "$d")"
+    found=0
+    while IFS= read -r -d '' f; do
+      if grep -q '^Exec=.*webapp-launch-' "$f" 2>/dev/null; then
+        n="$(basename "${f%.desktop}")"
+        if [[ "$(slugify "$n")" == "${base#*-}" ]]; then found=1; break; fi
+      fi
+    done < <(find "$DESKTOP_DIR" -maxdepth 1 -name '*.desktop' -print0 2>/dev/null)
+    if [[ "$found" == "0" ]]; then
+      $first || printf ','
+      first=false
+      printf '"%s"' "$(json_escape "$d")"
+      JSON_ISSUES+=("orphan data dir without .desktop: $d")
+    fi
+  done
+  for d in "$HOME"/.config/mozilla/firefox/*-webapp "$HOME"/.mozilla/firefox/*-webapp; do
+    [[ -d "$d" ]] || continue
+    $first || printf ','
+    first=false
+    printf '"%s"' "$(json_escape "$d")"
+    JSON_ISSUES+=("legacy orphan profile (pre-ice-style): $d")
+  done
+  printf ']'
+}
+
+PROBE=false
+DEPS=false
+JSON=false
+NAMES=()
+while (($# > 0)); do
+  case "$1" in
+    --probe) PROBE=true; shift ;;
+    --deps) DEPS=true; shift ;;
+    --json) JSON=true; shift ;;
+    --version) printf '%s %s\n' "$(basename "$0")" "$(cmd_version)"; exit 0 ;;
+    -h | --help)
+      echo "Usage: webapp-doctor [name...]"
+      echo "       webapp-doctor --probe [name]   # live window identity (auto backend)"
+      echo "       webapp-doctor --deps           # dependency check with install hints"
+      echo "       webapp-doctor --json [name...] # machine-readable report"
+      exit 0
+      ;;
+    --) shift; while (($# > 0)); do NAMES+=("$1"); shift; done; break ;;
+    -*) echo "webapp-doctor: unknown flag: $1" >&2; exit 1 ;;
+    *) NAMES+=("$1"); shift ;;
+  esac
+done
+
+if [[ "$DEPS" == "true" ]]; then
+  deps
+  exit $?
+fi
+
+if [[ "$PROBE" == "true" ]]; then
+  expect=""
+  if ((${#NAMES[@]} > 0)); then expect="$(slugify "${NAMES[0]}")"; fi
+  probe "$expect"
+  exit $?
+fi
+collect_names() {
+  if ((${#NAMES[@]} == 0)); then
+    mapfile -t NAMES < <(find "$DESKTOP_DIR" -maxdepth 1 -name '*.desktop' -print0 2>/dev/null |
+      while IFS= read -r -d '' f; do
+        grep -q '^Exec=.*webapp-launch-' "$f" 2>/dev/null && basename "${f%.desktop}"
+      done | sort)
+  fi
+}
+if [[ "$JSON" == "true" ]]; then
+  collect_names
+  JSON_ISSUES=()
+  printf '{"apps":['
+  jfirst=true
+  for n in ${NAMES[@]+"${NAMES[@]}"}; do
+    if [[ "$jfirst" == "true" ]]; then jfirst=false; else printf ','; fi
+    check_app_json "$n"
+  done
+  printf '],"orphans":'
+  orphans_json
+  printf ',"issue_count":%d}\n' "${#JSON_ISSUES[@]}"
+  exit "$([ "${#JSON_ISSUES[@]}" == "0" ] && echo 0 || echo 1)"
+fi
+collect_names
+if ((${#NAMES[@]} == 0)); then
+  echo "(no webapps installed)"
+fi
+for n in "${NAMES[@]}"; do check_app "$n"; done
+check_orphans
+
+if [[ "$ISSUES" == "0" ]]; then
+  echo "doctor: all green"
+else
+  echo "doctor: $ISSUES warning(s)"
+fi
+exit "$([ "$ISSUES" == "0" ] && echo 0 || echo 1)"
