@@ -51,6 +51,8 @@ WORKFLOWS
   Verify:       webapp-doctor Strafe
   Remove:       webapp-remove --purge Strafe
   Icon wrong:   launch from Kickoff, focus window, webapp-doctor --probe Strafe
+  Popup stuck:  hover the top edge, move onto the popup, Allow (one-time;
+                the grant ends any retry loop for good).
 
 WHERE THINGS LIVE
   Launchers ................. ~/.local/share/webapps/bin/webapp-*

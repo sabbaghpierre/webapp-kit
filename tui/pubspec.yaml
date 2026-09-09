@@ -1,6 +1,6 @@
 name: webapp_tui
 description: Nocterm TUI frontend for the webapp-kit isolated-webapps toolkit.
-version: 0.0.1
+version: 0.0.2
 
 environment:
   sdk: ^3.13.0

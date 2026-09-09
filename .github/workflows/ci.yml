@@ -9,8 +9,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: bash syntax
-        run: bash -n bin/* install.sh tool/*.sh
+      - name: bash syntax (scripts only; never the compiled binary)
+        run: bash -n bin/webapp-* install.sh tool/*.sh
       - name: version consistency (VERSION file vs pubspec literal)
         run: |
           test "$(cat VERSION)" = "$(sed -n 's/^version: //p' tui/pubspec.yaml)"

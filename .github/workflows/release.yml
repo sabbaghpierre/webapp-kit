@@ -33,7 +33,7 @@ jobs:
         run: dart test
 
       - name: bash syntax
-        run: bash -n bin/* install.sh tool/*.sh
+        run: bash -n bin/webapp-* install.sh tool/*.sh
 
       - name: compile TUI (linux-x64, version baked in)
         working-directory: tui
